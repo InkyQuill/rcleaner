@@ -1,11 +1,17 @@
-//! cargo-sweep 래핑: target/ 에서 오래된 산물을 정리하고 결과를 파싱한다.
-
+//! Embedded cleanup with native process guards and structured reports.
+use crate::{
+    config, disk,
+    i18n::{message, text},
+    safety,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-use crate::{disk, safety};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 /// 단일 프로젝트의 정리 결과.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,239 +47,178 @@ pub struct SweepReport {
     pub skip_reason: Option<String>,
 }
 
-/// sweep 을 실행한다.
-///
-/// - `dry_run=true` 면 삭제 없이 미리보기.
-/// - `force=false` 면 `root` 하위에서 빌드가 돌고 있을 때 스킵.
 pub fn run(root: &Path, days: u32, dry_run: bool, force: bool) -> Result<SweepReport> {
-    let disk_before = disk::stat(root);
-
-    // 안전장치: 빌드 중이면 스킵.
-    if !force && !dry_run {
-        let builds = safety::detect_active_builds(root)?;
-        if !builds.is_empty() {
-            return Ok(SweepReport {
-                timestamp: now_iso(),
-                mode: mode_str(dry_run).into(),
-                days,
-                root: root.to_string_lossy().into_owned(),
-                projects: vec![],
-                total_freed: None,
-                disk_before: disk_before.clone(),
-                disk_after: disk_before,
-                skipped: true,
-                skip_reason: Some(format!("{}개 프로세스 빌드 중", builds.len())),
-            });
-        }
-    }
-
-    let sweep_bin = find_cargo_sweep()?;
-
-    let mut cmd = Command::new(&sweep_bin);
-    cmd.arg("sweep")
-        .arg("--recursive")
-        .arg("--time")
-        .arg(days.to_string())
-        .arg(root);
-    if dry_run {
-        cmd.arg("--dry-run");
-    }
-    cmd.env("PATH", enhanced_path());
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("cargo-sweep 실행 실패: {}", sweep_bin.display()))?;
-
-    if !output.status.success() {
-        bail!(
-            "cargo-sweep 실패 (exit {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let (projects, total) = parse_output(&stdout);
-
-    let disk_after = disk::stat(root);
-
-    Ok(SweepReport {
-        timestamp: now_iso(),
-        mode: mode_str(dry_run).into(),
+    let root = config::validate(root, days)?;
+    std::fs::create_dir_all(config::config_dir())?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(config::config_dir().join("sweep.lock"))?;
+    fs2::FileExt::try_lock_exclusive(&lock).context(text("locked"))?;
+    let disk_before = disk::stat(&root);
+    let mut report = SweepReport {
+        timestamp: chrono::Local::now().to_rfc3339(),
+        mode: if dry_run { "dry-run" } else { "live" }.into(),
         days,
         root: root.to_string_lossy().into_owned(),
-        projects,
-        total_freed: total,
+        projects: vec![],
+        total_freed: None,
+        disk_after: disk_before.clone(),
         disk_before,
-        disk_after,
         skipped: false,
         skip_reason: None,
-    })
+    };
+    if !force && !dry_run {
+        let builds = safety::detect_active_builds(&root)?;
+        if !builds.is_empty() {
+            report.skipped = true;
+            report.skip_reason = Some(message("builds", &[&builds.len()]));
+            return Ok(report);
+        }
+    }
+    let targets = find_targets(&root)?;
+    if !dry_run {
+        // Never clean an ancestor of the running binary, even with a custom target-dir.
+        let executable = std::env::current_exe()?.canonicalize()?;
+        for target in &targets {
+            if executable.starts_with(target) {
+                bail!(message("self_target", &[&target.display()]));
+            }
+        }
+    }
+    // Metadata discovery may take time; check again immediately before each target.
+    let mut total = 0;
+    for target in targets {
+        if !force && !dry_run {
+            let builds = safety::detect_active_builds(&root)?;
+            if !builds.is_empty() {
+                report.skipped = true;
+                report.skip_reason = Some(message("builds", &[&builds.len()]));
+                break;
+            }
+        }
+        let bytes = rcleaner_sweep::remove_older_than(
+            &target,
+            Duration::from_secs(u64::from(days) * 86_400),
+            dry_run,
+        )
+        .with_context(|| message("cleanup_failed", &[&target.display()]))?;
+        total += bytes;
+        report.projects.push(SweptProject {
+            path: target.to_string_lossy().into_owned(),
+            freed: (bytes > 0).then(|| format_bytes(bytes)),
+        });
+    }
+    report.total_freed = Some(format_bytes(total));
+    report.disk_after = disk::stat(&root);
+    Ok(report)
 }
 
-/// cargo-sweep stdout 을 파싱한다.
-///
-/// 예상 형태:
-///   [INFO] Searching recursively for Rust project folders
-///   [INFO] Would clean: 516.33 MiB from "/path/target"   (dry-run)
-///   [INFO] Cleaned 516.33 MiB from "/path/target"        (live)
-///   [INFO] Cleaned nothing from "/path/target"
-///   [INFO] Total amount: 42.47 GiB
-fn parse_output(stdout: &str) -> (Vec<SweptProject>, Option<String>) {
-    let mut projects = Vec::new();
-    let mut total = None;
+#[derive(Deserialize)]
+struct Metadata {
+    target_directory: PathBuf,
+}
 
-    for line in stdout.lines() {
-        let l = line.trim();
-        let Some(rest) = l.strip_prefix("[INFO] ") else {
+fn find_targets(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let cargo = find_cargo()?;
+    let mut targets = BTreeSet::new();
+    let mut walk = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = walk.next() {
+        let entry = entry?;
+        if entry.file_type().is_dir() && entry.depth() > 0 {
+            let name = entry.file_name().to_string_lossy();
+            if name.starts_with('.') || name == "target" || targets.contains(entry.path()) {
+                walk.skip_current_dir();
+            }
             continue;
-        };
-
-        if let Some(t) = rest.strip_prefix("Total amount: ") {
-            total = Some(t.trim().to_string());
+        }
+        if !entry.file_type().is_file() || entry.file_name() != "Cargo.toml" {
             continue;
         }
-
-        // "... from "/path""  분할
-        if let Some((action, path_part)) = rest.split_once(" from \"") {
-            let path = path_part.trim_end_matches('"');
-            let freed = if action.contains("nothing") {
-                None
-            } else {
-                // dry-run: "Would clean: 516.33 MiB"  →  ": " 뒤
-                // live:   "Cleaned 516.33 MiB"       →  공백 뒤
-                action
-                    .split_once(": ")
-                    .or_else(|| action.split_once(' '))
-                    .map(|(_, s)| s.trim().to_string())
-            };
-            projects.push(SweptProject {
-                path: path.to_string(),
-                freed,
-            });
+        let output = Command::new(&cargo)
+            .args([
+                "metadata",
+                "--no-deps",
+                "--format-version",
+                "1",
+                "--offline",
+                "--manifest-path",
+            ])
+            .arg(entry.path())
+            .current_dir(entry.path().parent().unwrap_or(root))
+            .env("PATH", enhanced_path()?)
+            .output()
+            .context(text("metadata_failed"))?;
+        if !output.status.success() {
+            bail!(message(
+                "command_failed",
+                &[
+                    &format!("cargo metadata ({})", entry.path().display()),
+                    &String::from_utf8_lossy(&output.stderr)
+                ]
+            ));
+        }
+        let metadata: Metadata =
+            serde_json::from_slice(&output.stdout).context(text("metadata_failed"))?;
+        if metadata.target_directory.is_dir() {
+            targets.insert(metadata.target_directory.canonicalize()?);
         }
     }
-
-    (projects, total)
+    Ok(targets)
 }
 
-/// cargo-sweep 바이너리를 찾는다: PATH → ~/.cargo/bin/cargo-sweep 순.
-pub fn find_cargo_sweep() -> Result<PathBuf> {
-    if let Ok(p) = which("cargo-sweep") {
-        return Ok(p);
-    }
-    if let Some(home) = dirs::home_dir() {
-        let candidate = home.join(".cargo/bin/cargo-sweep");
-        if candidate.exists() {
-            return Ok(candidate);
+pub fn find_cargo() -> Result<PathBuf> {
+    if let Some(path) = config::load()?.and_then(|cfg| cfg.cargo) {
+        if path.is_file() {
+            return Ok(path);
         }
     }
-    bail!("cargo-sweep 을 찾을 수 없습니다. 다음으로 설치하세요:\n  cargo install cargo-sweep")
+    // Do not canonicalize rustup proxies: argv[0] must remain `cargo`.
+    which::which_in(
+        format!("cargo{}", std::env::consts::EXE_SUFFIX),
+        Some(enhanced_path()?),
+        std::env::current_dir()?,
+    )
+    .map_err(|_| anyhow::anyhow!(text("missing_cargo")))
 }
 
-fn which(bin: &str) -> Result<PathBuf> {
-    let out = Command::new("/usr/bin/which").arg(bin).output()?;
-    if !out.status.success() {
-        bail!("not found: {bin}");
+fn enhanced_path() -> Result<std::ffi::OsString> {
+    let mut paths = Vec::new();
+    if let Some(cargo_home) = std::env::var_os("CARGO_HOME") {
+        paths.push(PathBuf::from(cargo_home).join("bin"));
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        bail!("not found: {bin}");
+    if let Some(home) = crate::config::home_dir() {
+        paths.push(home.join(".cargo/bin"));
     }
-    Ok(PathBuf::from(s))
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    #[cfg(unix)]
+    paths.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"].map(PathBuf::from));
+    Ok(std::env::join_paths(paths)?)
 }
 
-/// launchd 좁은 PATH 보정용. ~/.cargo/bin 을 최우선.
-fn enhanced_path() -> String {
-    let mut parts: Vec<String> = vec![];
-    if let Some(home) = dirs::home_dir() {
-        parts.push(home.join(".cargo/bin").to_string_lossy().into_owned());
+fn format_bytes(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KiB", "MiB", "GiB", "TiB"] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
     }
-    parts.push("/opt/homebrew/bin".into());
-    parts.push("/usr/local/bin".into());
-    parts.push("/usr/bin".into());
-    parts.push("/bin".into());
-    if let Ok(p) = std::env::var("PATH") {
-        parts.push(p);
-    }
-    parts.join(":")
-}
-
-fn now_iso() -> String {
-    chrono::Local::now().to_rfc3339()
-}
-
-fn mode_str(dry_run: bool) -> &'static str {
-    if dry_run {
-        "dry-run"
-    } else {
-        "live"
-    }
+    format!("{value:.2} {unit}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_parse_output_dry_run() {
-        let stdout = "[INFO] Would clean: 516.33 MiB from \"/Volumes/MERCURY/PROJECTS/cardion/target\"\n[INFO] Total amount: 516.33 MiB\n";
-        let (projects, total) = parse_output(stdout);
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].path, "/Volumes/MERCURY/PROJECTS/cardion/target");
-        assert_eq!(projects[0].freed.as_deref(), Some("516.33 MiB"));
-        assert_eq!(total.as_deref(), Some("516.33 MiB"));
-    }
-
-    #[test]
-    fn test_parse_output_live() {
-        let stdout = "[INFO] Cleaned 10.10 GiB from \"/Volumes/MERCURY/PROJECTS/oxibrowser/target\"\n[INFO] Total amount: 10.10 GiB\n";
-        let (projects, total) = parse_output(stdout);
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].freed.as_deref(), Some("10.10 GiB"));
-        assert_eq!(total.as_deref(), Some("10.10 GiB"));
-    }
-
-    #[test]
-    fn test_parse_output_nothing() {
-        let stdout = "[INFO] Cleaned nothing from \"/Volumes/MERCURY/PROJECTS/oxi/target\"\n[INFO] Total amount: 0.00 B\n";
-        let (projects, total) = parse_output(stdout);
-        assert_eq!(projects.len(), 1);
-        assert!(projects[0].freed.is_none());
-        assert_eq!(total.as_deref(), Some("0.00 B"));
-    }
-
-    #[test]
-    fn test_parse_output_multiple_projects() {
-        let stdout = "\
-[INFO] Cleaned 1.00 GiB from \"/a/target\"
-[INFO] Cleaned nothing from \"/b/target\"
-[INFO] Cleaned 2.00 GiB from \"/c/target\"
-[INFO] Total amount: 3.00 GiB
-";
-        let (projects, total) = parse_output(stdout);
-        assert_eq!(projects.len(), 3);
-        assert_eq!(projects[0].freed.as_deref(), Some("1.00 GiB"));
-        assert!(projects[1].freed.is_none());
-        assert_eq!(projects[2].freed.as_deref(), Some("2.00 GiB"));
-        assert_eq!(total.as_deref(), Some("3.00 GiB"));
-    }
-
-    #[test]
-    fn test_mode_str() {
-        assert_eq!(mode_str(true), "dry-run");
-        assert_eq!(mode_str(false), "live");
-    }
-
-    #[test]
-    fn test_find_cargo_sweep_returns_path_or_error() {
-        // cargo-sweep 이 설치되어 있으면 Ok, 없으면 Err (둘 다 허용).
-        match find_cargo_sweep() {
-            Ok(p) => assert!(p.exists()),
-            Err(e) => assert!(
-                e.to_string().contains("설치"),
-                "에러 메시지에 설치 안내가 있어야 함: {e}"
-            ),
-        }
+    fn byte_counts_are_not_parsed_from_console_output() {
+        assert_eq!(format_bytes(0), "0.00 B");
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GiB");
     }
 }

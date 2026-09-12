@@ -1,11 +1,12 @@
-//! ~/.oxicleaner/ 설정 관리.
+//! ~/.rcleaner/ 설정 관리.
 
-use anyhow::Result;
+use crate::i18n::{message, text};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// oxicleaner 설정. `~/.oxicleaner/config.toml` 에 저장된다.
+/// rcleaner 설정. `~/.rcleaner/config.toml` 에 저장된다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// 재귀 스캔 루트 디렉토리.
@@ -13,6 +14,9 @@ pub struct Config {
     /// 보존 일수. 이 기간 이내에 사용된 산물은 삭제하지 않는다.
     #[serde(default = "default_days")]
     pub days: u32,
+    /// Absolute Cargo path retained for schedulers with a restricted PATH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo: Option<PathBuf>,
 }
 
 fn default_days() -> u32 {
@@ -24,18 +28,28 @@ impl Default for Config {
         Self {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             days: 30,
+            cargo: None,
         }
     }
 }
 
-/// 설정 디렉토리: `~/.oxicleaner/`
-pub fn config_dir() -> PathBuf {
+/// Honor Windows' user profile environment, with the native directory as fallback.
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".oxicleaner")
 }
 
-/// 설정 파일 경로: `~/.oxicleaner/config.toml`
+/// 설정 디렉토리: `~/.rcleaner/`
+pub fn config_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".rcleaner")
+}
+
+/// 설정 파일 경로: `~/.rcleaner/config.toml`
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
@@ -62,8 +76,8 @@ pub fn save(cfg: &Config) -> Result<()> {
 
 /// CLI 인자로 주어진 값이 있으면 그것을, 없으면 config.toml 의 값을 쓴다.
 /// 둘 다 없으면 기본값.
-pub fn resolve(cli_root: Option<&Path>, cli_days: Option<u32>) -> (PathBuf, u32) {
-    let cfg = load().ok().flatten();
+pub fn resolve(cli_root: Option<&Path>, cli_days: Option<u32>) -> Result<(PathBuf, u32)> {
+    let cfg = load().with_context(|| message("config_error", &[&config_path().display()]))?;
     let root = cli_root
         .map(PathBuf::from)
         .or_else(|| cfg.as_ref().map(|c| c.root.clone()))
@@ -71,7 +85,17 @@ pub fn resolve(cli_root: Option<&Path>, cli_days: Option<u32>) -> (PathBuf, u32)
     let days = cli_days
         .or_else(|| cfg.as_ref().map(|c| c.days))
         .unwrap_or(30);
-    (root, days)
+    Ok((root, days))
+}
+
+pub fn validate(root: &Path, days: u32) -> Result<PathBuf> {
+    if days == 0 {
+        bail!(text("invalid_days"));
+    }
+    if !root.is_dir() {
+        bail!(message("invalid_root", &[&root.display()]));
+    }
+    Ok(root.canonicalize()?)
 }
 
 #[cfg(test)]
@@ -84,6 +108,7 @@ mod tests {
         let cfg = Config {
             root: PathBuf::from("/Volumes/MERCURY/PROJECTS"),
             days: 14,
+            cargo: None,
         };
         let s = toml::to_string_pretty(&cfg).unwrap();
         assert!(s.contains("/Volumes/MERCURY/PROJECTS"));
@@ -107,7 +132,7 @@ mod tests {
     fn test_resolve_defaults() {
         // config::load() 가 실제 파일을 읽으므로 특정 값이 아닌
         // 유효한 범위 내인지만 확인한다.
-        let (root, days) = resolve(None, None);
+        let (root, days) = resolve(None, None).unwrap();
         assert!(!root.as_os_str().is_empty(), "루트는 항상 있어야 함");
         assert!(days > 0 && days <= 365, "days 는 1~365 범위: {days}");
     }
@@ -116,7 +141,7 @@ mod tests {
     #[test]
     fn test_resolve_prefers_cli() {
         // CLI 에서 Some(14) → 14 (config 무시)
-        let (_, days) = resolve(None, Some(14));
+        let (_, days) = resolve(None, Some(14)).unwrap();
         assert_eq!(days, 14);
     }
 }

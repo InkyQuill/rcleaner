@@ -1,0 +1,13 @@
+[package]
+name = "rcleaner-sweep"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

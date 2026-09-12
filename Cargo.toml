@@ -1,17 +1,23 @@
 [package]
-name = "oxicleaner"
+name = "rcleaner"
 version = "0.2.1"
 edition = "2021"
-description = "Recursive Rust target/ cleaner with launchd scheduling"
+authors = ["Pavel Obruchnikov <me@inkyquill.net>", "a7garden <a7garden@icloud.com>"]
+description = "Cross-platform Rust target/ cleaner with native scheduling"
 license = "MIT"
-repository = "https://github.com/a7garden/oxicleaner"
-homepage = "https://github.com/a7garden/oxicleaner"
-documentation = "https://github.com/a7garden/oxicleaner#readme"
+repository = "https://github.com/InkyQuill/rcleaner"
+homepage = "https://github.com/InkyQuill/rcleaner"
+documentation = "https://github.com/InkyQuill/rcleaner#readme"
 readme = "README.md"
-keywords = ["cargo", "cargo-sweep", "target", "cleanup", "launchd"]
+keywords = ["cargo", "cargo-sweep", "target", "cleanup", "scheduler"]
 categories = ["command-line-utilities", "development-tools::cargo-plugins"]
 
+[workspace]
+members = ["vendor/cargo-sweep"]
+
 [dependencies]
+rcleaner-sweep = { path = "vendor/cargo-sweep" }
+walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,7 +26,14 @@ anyhow = "1"
 dirs = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 inquire = "0.9"
+sys-locale = "0.3"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+fs2 = "0.4"
+which = "8"
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[dev-dependencies]
+tempfile = "3"

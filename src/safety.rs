@@ -1,28 +1,44 @@
-//! 빌드 중 감지. cargo/rustc 가 지정 루트 하위에서 돌고 있으면 정리를 미룬다.
-
-use anyhow::Result;
+//! Conservatively pause cleanup while any Cargo/rustc process is visible.
+//! Build output can be redirected independently of the process working directory.
+use crate::i18n::text;
+use anyhow::{bail, Result};
 use std::path::Path;
-use std::process::Command;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
-/// `root` 하위 경로에서 실행 중인 cargo/rustc 프로세스를 감지한다.
-/// 감지된 프로세스의 전체 명령줄 목록을 반환 (빈 벡터 = 빌드 없음).
-pub fn detect_active_builds(root: &Path) -> Result<Vec<String>> {
-    // pgrep -fl 은 정규식을 받는다. cargo|rustc 로 둘 다 잡는다.
-    let out = Command::new("pgrep").args(["-fl", "cargo|rustc"]).output();
+fn is_build(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_string_lossy().to_ascii_lowercase().as_str(),
+        "cargo" | "cargo.exe" | "rustc" | "rustc.exe"
+    )
+}
 
-    let mut active = Vec::new();
-    let stdout = match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => return Ok(active), // pgrep 없으면 감지 불가 → 통과
-    };
+pub fn detect_active_builds(_root: &Path) -> Result<Vec<String>> {
+    if !sysinfo::IS_SUPPORTED_SYSTEM {
+        bail!(text("process_unavailable"));
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    if system.processes().is_empty() {
+        bail!(text("process_unavailable"));
+    }
+    Ok(system
+        .processes()
+        .iter()
+        .filter(|(_, process)| is_build(process.name()))
+        .map(|(pid, process)| format!("{pid}: {}", process.name().to_string_lossy()))
+        .collect())
+}
 
-    let root_str = root.to_string_lossy();
-    for line in stdout.lines() {
-        // pgrep 자신은 "pgrep -fl cargo|rustc" 이라 'cargo' 텍스트를 포함하지만,
-        // 우리 oxicleaner가 트리거한 cargo-sweep 하위는 제외하지 않는다(아래 별도 처리).
-        if line.contains(root_str.as_ref()) {
-            active.push(line.to_string());
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn matches_only_build_executables_on_all_platforms() {
+        for name in ["cargo", "rustc", "cargo.exe", "RUSTC.EXE"] {
+            assert!(is_build(name.as_ref()));
+        }
+        for name in ["cargo-sweep", "cargo-sweep.exe", "editor", "my-cargo-tool"] {
+            assert!(!is_build(name.as_ref()));
         }
     }
-    Ok(active)
 }

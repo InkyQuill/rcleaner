@@ -243,11 +243,14 @@ fn install_binary(src: &Path, dest: &Path) -> Result<()> {
     // Stage first so failed copies do not truncate the installed executable.
     let staging = dest.with_extension("new");
     std::fs::copy(src, &staging)?;
-    #[cfg(windows)]
-    if metadata.is_some() {
-        std::fs::remove_file(dest)?;
-    }
-    std::fs::rename(&staging, dest)?;
+    replace_staged_binary(&staging, dest)
+}
+
+/// Replace in place without deleting the installed binary before the commit step.
+fn replace_staged_binary(staging: &Path, dest: &Path) -> Result<()> {
+    // The sibling staging file is on the same filesystem. rename replaces an
+    // existing file on Windows too; a failed rename must leave it available.
+    std::fs::rename(staging, dest)?;
     Ok(())
 }
 
@@ -277,6 +280,32 @@ pub fn parse() -> Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_replacement_preserves_installed_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("rcleaner");
+        std::fs::write(&dest, "installed version").unwrap();
+        // Model a staged file disappearing before the final rename.
+        let error = replace_staged_binary(&temp.path().join("missing.new"), &dest).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "installed version");
+    }
+
+    #[test]
+    fn installation_replaces_existing_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("rcleaner");
+        std::fs::write(&source, "new version").unwrap();
+        std::fs::write(&dest, "old version").unwrap();
+        install_binary(&source.canonicalize().unwrap(), &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new version");
+        assert!(!dest.with_extension("new").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn installation_replaces_symlink_to_running_binary() {

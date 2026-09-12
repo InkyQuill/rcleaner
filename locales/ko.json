@@ -76,5 +76,6 @@
   "commands": "명령",
   "options": "옵션",
   "help_flag": "도움말 표시",
-  "version_flag": "버전 표시"
+  "version_flag": "버전 표시",
+  "scan_permission_denied": "프로젝트 검색 중 접근할 수 없는 경로를 건너뜁니다: {0}"
 }

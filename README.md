@@ -114,7 +114,10 @@ numbered placeholders across catalogs.
 
 The scanner finds Cargo manifests below the root, skipping hidden directories,
 symlink traversal and conventional `target/` directories. Cargo metadata resolves
-actual target directories and shared workspace targets are deduplicated. A custom
+actual target directories and shared workspace targets are deduplicated.
+Permission-denied errors below the scan root produce a warning and skip that
+path, allowing accessible projects to be found. An unreadable scan root and
+other discovery or artifact-deletion errors still abort the run. A custom
 Cargo target directory may be **outside** the scan root; inspect `--dry-run` output.
 
 The embedded engine derives from cargo-sweep 0.8.0 and uses Cargo fingerprint

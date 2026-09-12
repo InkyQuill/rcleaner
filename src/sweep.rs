@@ -126,7 +126,21 @@ fn find_targets(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut targets = BTreeSet::new();
     let mut walk = walkdir::WalkDir::new(root).follow_links(false).into_iter();
     while let Some(entry) = walk.next() {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error)
+                if error.depth() > 0
+                    && error
+                        .io_error()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                // WalkDir resumes at the next sibling after a failed directory read.
+                // Only discovery is best-effort; failures deleting artifacts stay fatal.
+                eprintln!("{}", message("scan_permission_denied", &[&error]));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if entry.file_type().is_dir() && entry.depth() > 0 {
             let name = entry.file_name().to_string_lossy();
             if name.starts_with('.') || name == "target" || targets.contains(entry.path()) {

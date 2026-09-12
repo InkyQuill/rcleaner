@@ -208,3 +208,56 @@ fn schedule_lifecycle_uses_user_manager_and_absolute_paths() {
     let calls = std::fs::read_to_string(home.path().join("systemctl-args")).unwrap();
     assert!(calls.contains("--user\ndisable\n--now\nrcleaner.timer"));
 }
+
+#[cfg(unix)]
+#[test]
+fn discovery_skips_permission_denied_children_but_not_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("projects");
+    let denied = root.join("data-pg");
+    let project = root.join("healthy");
+    std::fs::create_dir_all(&denied).unwrap();
+    std::fs::create_dir_all(project.join("target")).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname='healthy'\n").unwrap();
+    let bin = home.path().join(".cargo/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    script(
+        &bin.join("cargo"),
+        "#!/bin/sh\n/bin/cat \"$HOME/metadata.json\"\n",
+    );
+    std::fs::write(
+        home.path().join("metadata.json"),
+        serde_json::json!({"target_directory": project.join("target")}).to_string(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&denied).is_ok() {
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("Permission test requires a user without permission bypass (not root)");
+        return;
+    }
+    let child = command(home.path())
+        .args(["sweep", "--dry-run", "--root"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    let root_result = command(home.path())
+        .args(["sweep", "--dry-run", "--root"])
+        .arg(&denied)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        child.status.success(),
+        "{}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(String::from_utf8_lossy(&child.stderr).contains("Skipping inaccessible path"));
+    assert!(String::from_utf8_lossy(&child.stderr).contains("data-pg"));
+    assert!(String::from_utf8_lossy(&child.stdout).contains("healthy"));
+    assert!(
+        !root_result.status.success(),
+        "An unreadable root must not report success"
+    );
+}

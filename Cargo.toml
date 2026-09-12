@@ -1,6 +1,6 @@
 [package]
 name = "rcleaner"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 authors = ["Pavel Obruchnikov <me@inkyquill.net>", "a7garden <a7garden@icloud.com>"]
 description = "Cross-platform Rust target/ cleaner with native scheduling"

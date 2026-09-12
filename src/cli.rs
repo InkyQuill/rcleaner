@@ -198,10 +198,14 @@ fn print_report(report: &sweep::SweepReport) {
             project.path
         );
     }
-    if let Some(total) = &report.total_freed {
+    if let Some(total) = report
+        .total_freed
+        .as_deref()
+        .filter(|total| *total != "0.00 B")
+    {
         println!(
             "{}",
-            message("total", &[total, &report.disk_before, &report.disk_after])
+            message("total", &[&total, &report.disk_before, &report.disk_after])
         );
     } else {
         println!("{}", message("nothing", &[&report.disk_before]));
@@ -219,18 +223,32 @@ pub(crate) fn install_self_binary() -> Result<PathBuf> {
     let src = std::env::current_exe()?.canonicalize()?;
     let dest = config::config_dir().join(format!("rcleaner{}", std::env::consts::EXE_SUFFIX));
     std::fs::create_dir_all(config::config_dir())?;
-    if dest.exists() && dest.canonicalize()? == src {
-        return Ok(dest);
+    install_binary(&src, &dest)?;
+    Ok(dest)
+}
+
+fn install_binary(src: &Path, dest: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(dest) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if metadata
+        .as_ref()
+        .is_some_and(|m| !m.file_type().is_symlink())
+        && dest.canonicalize()? == src
+    {
+        return Ok(());
     }
     // Stage first so failed copies do not truncate the installed executable.
     let staging = dest.with_extension("new");
-    std::fs::copy(&src, &staging)?;
+    std::fs::copy(src, &staging)?;
     #[cfg(windows)]
-    if dest.exists() {
-        std::fs::remove_file(&dest)?;
+    if metadata.is_some() {
+        std::fs::remove_file(dest)?;
     }
-    std::fs::rename(&staging, &dest)?;
-    Ok(dest)
+    std::fs::rename(&staging, dest)?;
+    Ok(())
 }
 
 /// Localize generated help as well as application descriptions.
@@ -259,6 +277,27 @@ pub fn parse() -> Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn installation_replaces_symlink_to_running_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("target/rcleaner");
+        std::fs::create_dir(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "binary").unwrap();
+        let source = source.canonicalize().unwrap();
+        let dest = temp.path().join("rcleaner");
+        std::os::unix::fs::symlink(&source, &dest).unwrap();
+        install_binary(&source, &dest).unwrap();
+        assert!(std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_file());
+        std::fs::remove_file(source).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "binary");
+        install_binary(&dest.canonicalize().unwrap(), &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "binary");
+    }
+
     #[test]
     fn omitted_days_uses_config() {
         let cli = Cli::try_parse_from(["rcleaner", "sweep"]).unwrap();

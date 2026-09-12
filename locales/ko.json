@@ -77,5 +77,6 @@
   "options": "옵션",
   "help_flag": "도움말 표시",
   "version_flag": "버전 표시",
-  "scan_permission_denied": "프로젝트 검색 중 접근할 수 없는 경로를 건너뜁니다: {0}"
+  "scan_permission_denied": "프로젝트 검색 중 접근할 수 없는 경로를 건너뜁니다: {0}",
+  "missing_home": "홈 디렉토리의 절대 경로를 확인할 수 없습니다"
 }

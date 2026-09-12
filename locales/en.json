@@ -77,5 +77,6 @@
   "options": "Options",
   "help_flag": "Print help",
   "version_flag": "Print version",
-  "scan_permission_denied": "Skipping inaccessible path while scanning: {0}"
+  "scan_permission_denied": "Skipping inaccessible path while scanning: {0}",
+  "missing_home": "Cannot determine an absolute home directory"
 }

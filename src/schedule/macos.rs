@@ -3,24 +3,20 @@
 use super::checked;
 use anyhow::Result;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// launchd 라벨 (plist Label 및 launchctl 식별자).
 pub const LABEL: &str = "local.rcleaner";
 
 /// plist 파일 경로: `~/Library/LaunchAgents/local.rcleaner.plist`
-pub fn plist_path() -> PathBuf {
-    crate::config::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Library/LaunchAgents/local.rcleaner.plist")
+fn plist_path(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents/local.rcleaner.plist")
 }
 
 /// launchd 로그 디렉토리: `~/Library/Logs/rcleaner/`
-pub fn log_dir() -> PathBuf {
-    crate::config::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Library/Logs/rcleaner")
+fn log_dir(home: &Path) -> PathBuf {
+    home.join("Library/Logs/rcleaner")
 }
 
 /// 스케줄을 활성화(설치/갱신) 한다.
@@ -31,12 +27,13 @@ pub fn log_dir() -> PathBuf {
 /// - `root`: 재귀 스캔 루트
 /// - `binary`: rcleaner 실행파일 절대경로 (plist 에 박힘)
 pub fn enable(weekday: u32, hour: u32, days: u32, root: &str, binary: &str) -> Result<()> {
-    disable()?;
+    let home = super::required_home(crate::config::home_dir())?;
+    disable_at(&home)?;
 
-    fs::create_dir_all(log_dir())?;
+    fs::create_dir_all(log_dir(&home))?;
 
-    let plist = render_plist(weekday, hour, days, root, binary);
-    let path = plist_path();
+    let plist = render_plist(&home, weekday, hour, days, root, binary);
+    let path = plist_path(&home);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -50,12 +47,17 @@ pub fn enable(weekday: u32, hour: u32, days: u32, root: &str, binary: &str) -> R
 
 /// 스케줄을 비활성화(제거)한다. plist 파일도 삭제. (로드되어 있지 않아도 조용히 통과.)
 pub fn disable() -> Result<()> {
+    let home = super::required_home(crate::config::home_dir())?;
+    disable_at(&home)
+}
+
+fn disable_at(home: &Path) -> Result<()> {
     let uid = uid()?;
     let target = format!("gui/{uid}/{LABEL}");
     if is_loaded()? {
         checked(Command::new("launchctl").args(["bootout", &target]))?;
     }
-    let p = plist_path();
+    let p = plist_path(home);
     if p.exists() {
         fs::remove_file(&p)?;
     }
@@ -81,16 +83,23 @@ pub fn is_loaded() -> Result<bool> {
     ))
 }
 
-fn render_plist(weekday: u32, hour: u32, days: u32, root: &str, binary: &str) -> String {
-    let home = crate::config::home_dir()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let path_env = format!("{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
-    let log_out = log_dir()
+fn render_plist(
+    home: &Path,
+    weekday: u32,
+    hour: u32,
+    days: u32,
+    root: &str,
+    binary: &str,
+) -> String {
+    let path_env = format!(
+        "{}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        home.display()
+    );
+    let log_out = log_dir(home)
         .join("launchd.out.log")
         .to_string_lossy()
         .into_owned();
-    let log_err = log_dir()
+    let log_err = log_dir(home)
         .join("launchd.err.log")
         .to_string_lossy()
         .into_owned();
@@ -104,7 +113,7 @@ fn render_plist(weekday: u32, hour: u32, days: u32, root: &str, binary: &str) ->
     }
     let binary_esc = esc(binary);
     let root_esc = esc(root);
-    let home_esc = esc(&home);
+    let home_esc = esc(&home.to_string_lossy());
     let path_env_esc = esc(&path_env);
 
     format!(
@@ -181,7 +190,14 @@ mod tests {
     /// XML 선언, DOCTYPE, plist/schema 가 포함되어야 하고 인자가 위치에 맞게 삽입되어야 함.
     #[test]
     fn test_render_plist_basic() {
-        let plist = render_plist(0, 3, 30, "/Volumes/MERCURY/PROJECTS", "/usr/bin/rcleaner");
+        let plist = render_plist(
+            Path::new("/Users/test & home"),
+            0,
+            3,
+            30,
+            "/Volumes/MERCURY/PROJECTS",
+            "/usr/bin/rcleaner",
+        );
         assert!(plist.starts_with(r#"<?xml"#));
         assert!(plist.contains("<integer>0</integer>"), "weekday 0");
         assert!(plist.contains("<integer>3</integer>"), "hour 3");
@@ -197,7 +213,7 @@ mod tests {
     fn test_render_plist_xml_escape() {
         let binary = "/Users/x&y/bin/<rcleaner>\".exe";
         let root = "/path/with/\"quotes\"&ampersands";
-        let plist = render_plist(0, 3, 30, root, binary);
+        let plist = render_plist(Path::new("/Users/test & home"), 0, 3, 30, root, binary);
         // 원래 문자는 XML 에 없어야 함
         assert!(!plist.contains("&y"), "& 는 &amp; 로 이스케이프되어야 함");
         assert!(

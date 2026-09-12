@@ -62,6 +62,16 @@ pub fn is_loaded() -> Result<bool> {
     bail!(text("unsupported"))
 }
 
+/// Resolve once before any scheduler mutation; never fall back to the working directory.
+#[cfg(any(target_os = "macos", test))]
+fn required_home(home: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+    let home = home
+        .filter(|path| path.is_absolute())
+        .context(text("missing_home"))?;
+    path_text(&home)?;
+    Ok(home)
+}
+
 fn path_text(path: &Path) -> Result<&str> {
     let value = path.to_str().context(text("invalid_path"))?;
     if value.chars().any(char::is_control) {
@@ -94,6 +104,16 @@ fn checked(command: &mut Command) -> Result<std::process::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn missing_or_relative_home_is_rejected() {
+        assert!(required_home(None).is_err());
+        assert!(required_home(Some(std::path::PathBuf::from("."))).is_err());
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            required_home(Some(temp.path().to_path_buf())).unwrap(),
+            temp.path()
+        );
+    }
     #[test]
     fn scheduler_rejects_control_characters() {
         assert!(path_text(Path::new("/tmp/a\nExecStart=bad")).is_err());

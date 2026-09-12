@@ -123,8 +123,14 @@ fn dry_run_uses_embedded_engine_and_config_retention() {
         String::from_utf8_lossy(&output.stderr)
     );
     let args = std::fs::read_to_string(home.path().join("args")).unwrap();
-    assert!(args.contains("metadata\n--no-deps\n--format-version\n1\n--offline\n--manifest-path\n"));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("0.00 B"));
+    assert_eq!(
+        args,
+        format!(
+            "metadata\n--no-deps\n--format-version\n1\n--offline\n--manifest-path\n{}\n",
+            root.canonicalize().unwrap().join("Cargo.toml").display()
+        )
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Nothing to clean"));
     let preview = command(home.path())
         .args(["sweep", "--days", "30", "--dry-run"])
         .output()

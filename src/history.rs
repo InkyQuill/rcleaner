@@ -1,4 +1,4 @@
-//! 정리 이력 관리 (`~/.oxicleaner/history.jsonl`).
+//! 정리 이력 관리 (`~/.rcleaner/history.jsonl`).
 
 use anyhow::Result;
 use std::fs::{self, OpenOptions};
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use crate::config::config_dir;
 use crate::sweep::SweepReport;
 
-/// 히스토리 파일 경로: `~/.oxicleaner/history.jsonl`
+/// 히스토리 파일 경로: `~/.rcleaner/history.jsonl`
 pub fn history_path() -> PathBuf {
     config_dir().join("history.jsonl")
 }

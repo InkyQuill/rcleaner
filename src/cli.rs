@@ -1,70 +1,51 @@
-//! CLI 정의 (clap) 및 명령 디스패치.
-
+//! Command-line interface shared by all supported platforms.
+use crate::{
+    config, history,
+    i18n::{message, text, weekday},
+    schedule, sweep,
+};
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-use crate::{config, history, schedule, sweep};
-
 #[derive(Parser)]
-#[command(
-    name = "oxicleaner",
-    version,
-    about = "Recursive Rust target/ cleaner with launchd scheduling",
-    long_about = None,
-    // 서브커맨드 없이 `oxicleaner` 만 쳐도 sweep 이 실행된다.
-    subcommand_required = false,
-)]
+#[command(name = "rcleaner", version, about = text("about"))]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-
-    /// 스캔 루트 (기본: config.toml 의 root). install/sweep 공통.
-    #[arg(long, short, global = true)]
+    #[arg(long, short, global = true, help = text("root_help"))]
     root: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// 설정 마법사 실행 (인터랙티브).
+    #[command(about = text("setup_help"))]
     Setup,
-
-    /// target/ 정리 실행 (서브커맨드 없이 `oxicleaner` 만 쳐도 동일).
+    #[command(about = text("sweep_help"))]
     Sweep {
-        /// 보존 일수 — 이 기간 이내 산물은 유지.
-        #[arg(long, default_value_t = 30)]
-        days: u32,
-        /// 삭제 없이 미리보기.
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..), help = text("days_help"))]
+        days: Option<u32>,
+        #[arg(long, help = text("dry_help"))]
         dry_run: bool,
-        /// 빌드 중이어도 강제 실행.
-        #[arg(long)]
+        #[arg(long, help = text("force_help"))]
         force: bool,
     },
-
-    /// launchd 스케줄 활성화(설치/갱신).
+    #[command(about = text("enable_help"))]
     Enable {
-        /// 요일: 0(일) ~ 6(토). 기본 일요일.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=6), help = text("weekday_help"))]
         weekday: u32,
-        /// 시각(시): 0 ~ 23. 기본 새벽 3시.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(0..=23), help = text("hour_help"))]
         hour: u32,
-        /// 보존 일수 (지정 안 하면 config.toml 의 days 또는 30).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..), help = text("days_help"))]
         days: Option<u32>,
     },
-
-    /// launchd 스케줄 비활성화(제거).
+    #[command(about = text("disable_help"))]
     Disable,
-
-    /// 스케줄 로드 여부 + 마지막 정리 결과.
+    #[command(about = text("status_help"))]
     Status,
-
-    /// 정리 이력 조회.
+    #[command(about = text("history_help"))]
     History {
-        /// 표시할 건수.
-        #[arg(long, short, default_value_t = 10)]
+        #[arg(long, short, default_value_t = 10, help = text("limit_help"))]
         limit: usize,
     },
 }
@@ -73,126 +54,79 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             None => {
-                let (root, days) = config::resolve(self.root.as_deref(), None);
+                let (root, days) = config::resolve(self.root.as_deref(), None)?;
                 run_sweep(&root, days, false, false)
             }
-            Some(Command::Setup) => crate::setup::run(),
+            Some(Command::Setup) => crate::setup::run(self.root.as_deref()),
             Some(Command::Sweep {
                 days,
                 dry_run,
                 force,
             }) => {
-                let (root, cfg_days) = config::resolve(self.root.as_deref(), Some(days));
-                run_sweep(&root, cfg_days, dry_run, force)
+                let (root, days) = config::resolve(self.root.as_deref(), days)?;
+                run_sweep(&root, days, dry_run, force)
             }
             Some(Command::Enable {
-                weekday,
+                weekday: day,
                 hour,
                 days,
             }) => {
-                let (root, cfg_days) = config::resolve(self.root.as_deref(), days);
-                let cfg = config::Config {
-                    root: root.clone(),
-                    days: cfg_days,
-                };
-                config::save(&cfg)?;
-
-                // 사전 검증: cargo-sweep 이 설치되어 있어야 한다.
-                // 설치되지 않았으면 지금 알려주고, 조용한 백그라운드 실패를 방지한다.
-                sweep::find_cargo_sweep().map_err(|e| {
-                    anyhow::anyhow!(
-                        "{}
-
-  먼저 설치하세요: cargo install cargo-sweep",
-                        e
-                    )
-                })?;
-
-                // 핵심: 스케줄러가 가리킬 바이너리를 ~/.oxicleaner/oxicleaner 로 복사한다.
-                // oxicleaner 자신의 target/ 도 sweep 대상이므로 target/ 안의 바이너리를
-                // 직접 가리키면 자기 자신을 지워버리는 사고가 발생한다.
-                let installed_bin = install_self_binary()?;
-                schedule::enable(
-                    weekday,
-                    hour,
-                    cfg_days,
-                    &root.to_string_lossy(),
-                    &installed_bin.to_string_lossy(),
-                )?;
-
-                println!("✅ 스케줄 활성화 완료");
-                println!("   주기    : 매주 {} {:02}:00", weekday_name(weekday), hour);
-                println!("   루트    : {}", root.display());
-                println!("   보존    : {}일", cfg_days);
-                println!("   바이너리: {}", installed_bin.display());
-                println!("   로그    : {}/", schedule::log_dir().display());
-                println!();
-                println!("   확인    : oxicleaner status");
-                println!("   즉시실행: launchctl start {}", schedule::LABEL);
-                Ok(())
+                let (root, days) = config::resolve(self.root.as_deref(), days)?;
+                enable(&root, days, day, hour)
             }
             Some(Command::Disable) => {
                 schedule::disable()?;
-                println!("✅ 스케줄 비활성화 완료 ({})", schedule::LABEL);
+                println!("{}", text("disabled"));
                 Ok(())
             }
             Some(Command::Status) => {
-                if schedule::is_loaded() {
-                    println!("스케줄: ✅ 로드됨 ({})", schedule::LABEL);
-                    println!("  plist: {}", schedule::plist_path().display());
+                println!(
+                    "{}",
+                    message(
+                        "status",
+                        &[
+                            &schedule::name(),
+                            &text(if schedule::is_loaded()? { "on" } else { "off" })
+                        ]
+                    )
+                );
+                if let Some(last) = history::read(1)?.first() {
+                    println!("{}", message("last", &[&last.timestamp]));
+                    print_report(last);
                 } else {
-                    println!("스케줄: ❌ 미설치");
-                }
-                println!();
-                match history::read(1) {
-                    Ok(recs) if !recs.is_empty() => {
-                        let last = &recs[0];
-                        println!("마지막 실행: {}", last.timestamp);
-                        println!("  모드: {}", last.mode);
-                        if last.skipped {
-                            println!(
-                                "  결과: 스킵 — {}",
-                                last.skip_reason.as_deref().unwrap_or("?")
-                            );
-                        } else if let Some(t) = &last.total_freed {
-                            println!(
-                                "  확보: {} (disk: {} → {})",
-                                t, last.disk_before, last.disk_after
-                            );
-                        }
-                    }
-                    _ => println!("실행 이력 없음"),
+                    println!("{}", text("no_history"));
                 }
                 Ok(())
             }
             Some(Command::History { limit }) => {
-                let recs = history::read(limit)?;
-                if recs.is_empty() {
-                    println!("이력 없음");
+                let records = history::read(limit)?;
+                if records.is_empty() {
+                    println!("{}", text("no_history"));
                     return Ok(());
                 }
-                println!("{:<19} {:<8} {:>12}  disk 변화", "시각", "모드", "확보");
-                println!("{}", "-".repeat(70));
-                for r in recs {
-                    let total = r.total_freed.clone().unwrap_or_else(|| {
-                        if r.skipped {
-                            "SKIP".into()
-                        } else {
-                            "0".into()
-                        }
-                    });
-                    let disk = if r.skipped {
-                        r.disk_before.clone()
-                    } else {
-                        format!("{} → {}", r.disk_before, r.disk_after)
-                    };
+                println!("{}", text("history_header"));
+                for r in records {
                     println!(
-                        "{:<19} {:<8} {:>12}  {}",
+                        "{}  {}  {}  {} → {}",
                         fmt_ts(&r.timestamp),
-                        r.mode,
-                        total,
-                        disk
+                        text(if r.mode == "dry-run" {
+                            "dry-run"
+                        } else {
+                            "live"
+                        }),
+                        r.total_freed.as_deref().unwrap_or("—"),
+                        r.disk_before,
+                        r.disk_after
                     );
+                    if r.skipped {
+                        println!(
+                            "{}",
+                            message(
+                                "skipped",
+                                &[&r.skip_reason.as_deref().unwrap_or(text("unknown"))]
+                            )
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -200,126 +134,220 @@ impl Cli {
     }
 }
 
-/// sweep 실행 + 리포트 출력 + 히스토리 기록.
-fn run_sweep(root: &Path, days: u32, dry_run: bool, force: bool) -> Result<()> {
-    eprintln!(
-        "oxicleaner: root={}, keep={}d, mode={}",
-        root.display(),
+pub(crate) fn enable(root: &Path, days: u32, day: u32, hour: u32) -> Result<()> {
+    let root = config::validate(root, days)?;
+    schedule::validate(day, hour)?;
+    let cargo = Some(sweep::find_cargo()?);
+    let binary = install_self_binary()?;
+    config::save(&config::Config {
+        root: root.clone(),
         days,
-        if dry_run { "dry-run" } else { "live" }
+        cargo,
+    })?;
+    schedule::enable(day, hour, days, &root, &binary)?;
+    println!(
+        "{}",
+        message(
+            "enabled",
+            &[&schedule::name(), &weekday(day), &format!("{hour:02}")]
+        )
     );
+    println!("{}", message("root", &[&root.display()]));
+    println!("{}", message("retention", &[&days]));
+    println!("{}", message("binary", &[&binary.display()]));
+    Ok(())
+}
 
+pub(crate) fn run_sweep(root: &Path, days: u32, dry_run: bool, force: bool) -> Result<()> {
+    eprintln!(
+        "{}",
+        message(
+            "run",
+            &[
+                &root.display(),
+                &days,
+                &text(if dry_run { "dry-run" } else { "live" })
+            ]
+        )
+    );
     let report = sweep::run(root, days, dry_run, force)?;
-
-    if report.skipped {
-        println!(
-            "⏭  스킵: {}",
-            report.skip_reason.as_deref().unwrap_or("(사유 없음)")
-        );
-        // 스킵도 이력에 남긴다 (왜 안 돌았는지 추적).
-        history::append(&report)?;
-        return Ok(());
-    }
-
-    println!();
-    for p in &report.projects {
-        match &p.freed {
-            Some(f) => println!("  ✓ {:>10}  {}", f, p.path),
-            None => println!("    {:>10}  {}", "—", p.path),
-        }
-    }
-
-    println!();
-    if let Some(t) = &report.total_freed {
-        println!(
-            "총 확보: {}   (disk: {} → {})",
-            t, report.disk_before, report.disk_after
-        );
-    } else {
-        println!("정리 대상 없음   (disk: {})", report.disk_before);
-    }
-
+    print_report(&report);
     if !dry_run {
         history::append(&report)?;
     }
     Ok(())
 }
 
-fn weekday_name(weekday: u32) -> &'static str {
-    match weekday {
-        0 => "일요일",
-        1 => "월요일",
-        2 => "화요일",
-        3 => "수요일",
-        4 => "목요일",
-        5 => "금요일",
-        6 => "토요일",
-        _ => "?",
+fn print_report(report: &sweep::SweepReport) {
+    if report.skipped {
+        println!(
+            "{}",
+            message(
+                "skipped",
+                &[&report.skip_reason.as_deref().unwrap_or(text("unknown"))]
+            )
+        );
+        if report.projects.is_empty() {
+            return;
+        }
+    }
+    for project in &report.projects {
+        println!(
+            "  {:>10}  {}",
+            project.freed.as_deref().unwrap_or("—"),
+            project.path
+        );
+    }
+    if let Some(total) = report
+        .total_freed
+        .as_deref()
+        .filter(|total| *total != "0.00 B")
+    {
+        println!(
+            "{}",
+            message("total", &[&total, &report.disk_before, &report.disk_after])
+        );
+    } else {
+        println!("{}", message("nothing", &[&report.disk_before]));
     }
 }
 
-/// RFC3339 타임스탬프를 "YYYY-MM-DD HH:MM" 으로 간소화. 파싱 실패시 원본 반환.
 fn fmt_ts(ts: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|_| ts.to_string())
 }
 
-/// 현재 실행 중인 oxicleaner 바이너리를 `~/.oxicleaner/oxicleaner` 로 복사한다.
-///
-/// 스케줄러(sweep)가 프로젝트 target/ 안의 바이너리를 직접 가리키면
-/// 자기 자신을 지워버리는 사고가 생긴다. config 디렉토리는 sweep 대상이
-/// 아니므로 안전하다.
+/// Keep the scheduled executable outside build artifacts, including on Windows.
 pub(crate) fn install_self_binary() -> Result<PathBuf> {
-    let src = std::env::current_exe()?;
-    let dest = config::config_dir().join("oxicleaner");
+    let src = std::env::current_exe()?.canonicalize()?;
+    let dest = config::config_dir().join(format!("rcleaner{}", std::env::consts::EXE_SUFFIX));
     std::fs::create_dir_all(config::config_dir())?;
-    std::fs::copy(&src, &dest)?;
-    // 실행 권한 보장.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms)?;
-    }
+    install_binary(&src, &dest)?;
     Ok(dest)
+}
+
+fn install_binary(src: &Path, dest: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(dest) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if metadata
+        .as_ref()
+        .is_some_and(|m| !m.file_type().is_symlink())
+        && dest.canonicalize()? == src
+    {
+        return Ok(());
+    }
+    // Stage first so failed copies do not truncate the installed executable.
+    let staging = dest.with_extension("new");
+    std::fs::copy(src, &staging)?;
+    replace_staged_binary(&staging, dest)
+}
+
+/// Replace in place without deleting the installed binary before the commit step.
+fn replace_staged_binary(staging: &Path, dest: &Path) -> Result<()> {
+    // The sibling staging file is on the same filesystem. rename replaces an
+    // existing file on Windows too; a failed rename must leave it available.
+    std::fs::rename(staging, dest)?;
+    Ok(())
+}
+
+/// Localize generated help as well as application descriptions.
+pub fn parse() -> Cli {
+    fn localized(mut command: clap::Command) -> clap::Command {
+        command = command.disable_help_subcommand(true);
+        command.build();
+        command
+            .help_template(text("help_template"))
+            .subcommand_help_heading(text("commands"))
+            .mut_args(|arg| {
+                let arg = match arg.get_id().as_str() {
+                    "help" => arg.help(text("help_flag")),
+                    "version" => arg.help(text("version_flag")),
+                    _ => arg,
+                };
+                arg.help_heading(text("options"))
+            })
+            .mut_subcommands(localized)
+    }
+    let mut command = localized(Cli::command());
+    let matches = command.clone().get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.format(&mut command).exit())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_weekday_name() {
-        assert_eq!(weekday_name(0), "일요일");
-        assert_eq!(weekday_name(1), "월요일");
-        assert_eq!(weekday_name(2), "화요일");
-        assert_eq!(weekday_name(3), "수요일");
-        assert_eq!(weekday_name(4), "목요일");
-        assert_eq!(weekday_name(5), "금요일");
-        assert_eq!(weekday_name(6), "토요일");
-        assert_eq!(weekday_name(99), "?");
+    fn failed_replacement_preserves_installed_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("rcleaner");
+        std::fs::write(&dest, "installed version").unwrap();
+        // Model a staged file disappearing before the final rename.
+        let error = replace_staged_binary(&temp.path().join("missing.new"), &dest).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "installed version");
     }
 
     #[test]
-    fn test_fmt_ts() {
-        // 한국 시간대 (+09:00)
-        let ts = "2026-06-15T16:11:43.604301+09:00";
-        assert_eq!(fmt_ts(ts), "2026-06-15 16:11");
+    fn installation_replaces_existing_regular_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("rcleaner");
+        std::fs::write(&source, "new version").unwrap();
+        std::fs::write(&dest, "old version").unwrap();
+        install_binary(&source.canonicalize().unwrap(), &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new version");
+        assert!(!dest.with_extension("new").exists());
+    }
 
-        // UTC
-        let ts = "2026-06-15T07:11:43.604301Z";
-        assert_eq!(fmt_ts(ts), "2026-06-15 07:11");
-
-        // 음수 시간대
-        let ts = "2026-06-15T03:11:43.000000-04:00";
-        assert_eq!(fmt_ts(ts), "2026-06-15 03:11");
+    #[cfg(unix)]
+    #[test]
+    fn installation_replaces_symlink_to_running_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("target/rcleaner");
+        std::fs::create_dir(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "binary").unwrap();
+        let source = source.canonicalize().unwrap();
+        let dest = temp.path().join("rcleaner");
+        std::os::unix::fs::symlink(&source, &dest).unwrap();
+        install_binary(&source, &dest).unwrap();
+        assert!(std::fs::symlink_metadata(&dest)
+            .unwrap()
+            .file_type()
+            .is_file());
+        std::fs::remove_file(source).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "binary");
+        install_binary(&dest.canonicalize().unwrap(), &dest).unwrap();
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), "binary");
     }
 
     #[test]
-    fn test_fmt_ts_fallback_on_bad_input() {
-        let ts = "not-a-timestamp";
-        assert_eq!(fmt_ts(ts), "not-a-timestamp");
+    fn omitted_days_uses_config() {
+        let cli = Cli::try_parse_from(["rcleaner", "sweep"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Sweep { days: None, .. })
+        ));
+    }
+    #[test]
+    fn rejects_invalid_schedule_and_retention() {
+        for args in [
+            ["rcleaner", "enable", "--weekday", "7"],
+            ["rcleaner", "enable", "--hour", "24"],
+            ["rcleaner", "sweep", "--days", "0"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+    #[test]
+    fn timestamps_preserve_offset() {
+        assert_eq!(fmt_ts("2026-06-15T16:11:43+09:00"), "2026-06-15 16:11");
+        assert_eq!(fmt_ts("invalid"), "invalid");
     }
 }

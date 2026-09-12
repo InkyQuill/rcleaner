@@ -1,163 +1,219 @@
-# oxicleaner
+# rcleaner
 
-[![Crates.io](https://img.shields.io/badge/crates.io-coming%20soon-orange)](https://crates.io)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+A cross-platform CLI for cleaning old Rust build artifacts across multiple Cargo
+projects, with native weekly scheduling and English, Russian and Korean interfaces.
 
-> **Recursive Rust `target/` cleaner with launchd scheduling.**
->
-> Wraps [cargo-sweep](https://github.com/holmgr/cargo-sweep) to clean stale build
-> artifacts across **all** Cargo projects under a root, while preserving recently
-> used artifacts so your next build stays fast. Installs and manages its own macOS
-> `launchd` schedule, records history, and refuses to run while a build is in
-> progress.
+**rcleaner is a fork of [oxicleaner](https://github.com/a7garden/oxicleaner),
+originally written by [a7garden](https://github.com/a7garden)
+(`a7garden@icloud.com`) under the MIT license.** This fork is maintained by
+Pavel Obruchnikov (InkyQuill, `me@inkyquill.net`). It adds Linux and Windows
+support alongside macOS, system-language selection, an embedded cleanup engine
+and downloadable release packaging.
 
-`oxicleaner` was built for the [oxios](https://github.com/a7garden/oxios) dev
-machine, where dozens of worktrees and sibling Rust projects had quietly amassed
-**~280 GB** of duplicated, feature-combination-specific build artifacts.
-
-## Why
-
-`cargo` doesn't garbage-collect `target/`. Every feature combination, toolchain,
-profile, and codegen-unit split produces a fresh set of `.rlib` / `.rcgu.o`
-files. Over months these accumulate until a single project can balloon to dozens
-of duplicate variants of the same crate:
-
-| crate | duplicate `.rlib` variants found |
-|-------|----------------------------------:|
-| oxios_gateway | 124 |
-| oxios_kernel | 115 |
-| oxios_ouroboros | 97 |
-| … | … |
-
-`oxicleaner` automates the cleanup so the disk never fills up again — on a
-schedule, safely, with a record of what it did.
-
-## How it works
-
-1. **Recursive scan** — finds every `Cargo.toml` under the configured root and
-   the matching `target/` for each.
-2. **cargo-sweep** — for each project, deletes build artifacts **older than N
-   days** (default 30). Anything you built recently is kept, so the next
-   incremental build is still fast.
-3. **Safety guard** — if any `cargo`/`rustc` process is running under the root,
-   the run is skipped (rescheduled to next cycle) instead of risking corruption.
-4. **launchd schedule** — `oxicleaner enable` writes and loads its own plist.
-   The scheduled binary lives in `~/.oxicleaner/` (outside any `target/`), so it
-   can never delete itself.
-5. **History** — every run (including skips) is appended to
-   `~/.oxicleaner/history.jsonl` and queryable via `oxicleaner history`.
+The [original oxicleaner MIT license](licenses/oxicleaner-MIT.txt) is preserved
+verbatim. See [LICENSE](LICENSE) for this fork and [THIRD_PARTY.md](THIRD_PARTY.md)
+for the embedded cargo-sweep attribution.
 
 ## Install
 
-```bash
-# 1. runtime dependency
-cargo install cargo-sweep
+Download the archive for your platform from
+[Releases](https://github.com/InkyQuill/rcleaner/releases), extract it, and place
+`rcleaner` (`rcleaner.exe` on Windows) in a directory on your `PATH`.
+Each archive has a `.sha256` checksum file.
 
-# 2. build oxicleaner
-git clone https://github.com/a7garden/oxicleaner
-cd oxicleaner
-cargo build --release
+| Platform | Release target | Scheduler |
+| --- | --- | --- |
+| Linux x64 | `x86_64-unknown-linux-gnu` | systemd user timer |
+| Linux ARM64 | `aarch64-unknown-linux-gnu` | systemd user timer |
+| macOS Intel | `x86_64-apple-darwin` | launchd LaunchAgent |
+| macOS Apple Silicon | `aarch64-apple-darwin` | launchd LaunchAgent |
+| Windows x64 | `x86_64-pc-windows-msvc` | Task Scheduler |
 
-# 3. (optional) put it on PATH
-cp target/release/oxicleaner ~/.cargo/bin/
+Linux release binaries are built on Ubuntu 22.04 and require glibc 2.35 or newer.
+On older distributions or musl-based systems, build from source.
+
+**No separate `cargo-sweep` installation is required.** Its age-based cleanup
+engine is embedded in this binary. Cargo from your Rust toolchain is still needed:
+`cargo metadata --offline --no-deps` locates each project's actual target directory,
+including workspace and custom `target-dir` settings. The tool searches
+`CARGO_HOME/bin`, `~/.cargo/bin` and `PATH`. Metadata failures abort cleanup instead
+of silently skipping a project. A project must be resolvable offline by Cargo.
+
+To build from source:
+
+```sh
+git clone https://github.com/InkyQuill/rcleaner.git
+cd rcleaner
+cargo install --path . --locked
 ```
 
-> **Platform:** macOS only (launchd scheduling). The `sweep` command itself
-> works anywhere cargo-sweep does.
+Install outside `target/`: live cleanup refuses to clean a directory containing
+the running executable.
 
 ## Usage
 
-```bash
-# 🆕 Interactive setup wizard (recommended first run)
-oxicleaner setup
-#   → walks you through root, retention, schedule, weekday/time
-#   → writes config.toml, enables launchd, optionally runs first sweep
+```sh
+# Interactive setup: root, retention, weekly schedule, optional first cleanup
+rcleaner setup
 
-# Clean now, keeping artifacts from the last 30 days
-oxicleaner sweep
-oxicleaner sweep --days 60
-oxicleaner sweep --dry-run          # preview only — deletes nothing
-oxicleaner sweep --root ~/projects  # override scan root
+# Preview first, keeping artifacts used in the last 30 days
+rcleaner sweep --root /path/to/projects --days 30 --dry-run
 
-# Enable the weekly schedule (non-interactive)
-oxicleaner enable
-oxicleaner enable --weekday 5 --hour 4 --days 45   # Fridays 04:00, keep 45d
+# Clean now; omitted root/days use config.toml, then current directory/30
+rcleaner sweep
+rcleaner sweep --days 60
 
-# Inspect
-oxicleaner status       # is the schedule loaded? what did the last run do?
-oxicleaner history      # recent runs (timestamp, mode, freed, disk delta)
-oxicleaner history -n 20
+# Fridays at 04:00 local time, retain 45 days
+rcleaner enable --root /path/to/projects --weekday 5 --hour 4 --days 45
 
-# Disable the schedule
-oxicleaner disable
-
-# Run with no subcommand → sweep (handy for the scheduled invocation)
-oxicleaner
+rcleaner status
+rcleaner history --limit 20
+rcleaner disable
 ```
 
-### Flags
+On Windows, use paths such as `--root "C:\Users\Pavel\Projects"`. Paths containing
+spaces or Unicode are supported. Schedule paths are stored as absolute paths.
 
-| Flag | Scope | Description |
-|------|-------|-------------|
-| `-r, --root <PATH>` | global | Scan root (defaults to `config.toml`) |
-| `--days <N>` | sweep, enable | Keep artifacts newer than N days |
-| `--dry-run` | sweep | Preview without deleting |
-| `--force` | sweep | Run even if a build is in progress |
-| `--weekday <0-6>` | enable | 0=Sun … 6=Sat (default 0) |
-| `--hour <0-23>` | enable | Hour of day (default 3) |
-| `-n, --limit <N>` | history | Number of records to show |
+No subcommand runs a live sweep with the saved settings. `--force` bypasses the
+build-process guard, but does not bypass the lock preventing overlapping
+rcleaner runs. `--days` must be positive; weekday is 0 (Sunday) through 6
+(Saturday), and hour is 0 through 23.
 
-## File locations
+## Languages
 
-| Path | Purpose |
-|------|---------|
-| `~/.oxicleaner/config.toml` | Root + retention setting (written by `enable`) |
-| `~/.oxicleaner/oxicleaner` | Scheduled binary copy (kept out of any `target/`) |
-| `~/.oxicleaner/history.jsonl` | One JSON line per run |
-| `~/Library/LaunchAgents/local.oxicleaner.plist` | launchd schedule |
-| `~/Library/Logs/oxicleaner/` | launchd stdout/stderr + scheduled-run output |
+The interface automatically selects **English (`en`), Russian (`ru`) or Korean
+(`ko`)** using the system locale. Regional variants such as `ru_RU.UTF-8`, `ru-RU`
+and `ko-KR` map to the corresponding language. Other locales fall back to English.
 
-## Example output
+On Linux, locale discovery uses `LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, then `LANG`.
+On macOS and Windows it uses native system language APIs. Scheduled runs use the
+scheduler's environment/system language, which can differ from an interactive
+terminal's environment.
 
-```
-$ oxicleaner sweep --dry-run --days 30
-oxicleaner: root=/Volumes/MERCURY/PROJECTS, keep=30d, mode=dry-run
+For an explicit override:
 
-   ✓   10.10 GiB  /Volumes/MERCURY/PROJECTS/cardion/src-tauri/target
-   ✓   17.17 GiB  /Volumes/MERCURY/PROJECTS/clawgarden/target
-      —          /Volumes/MERCURY/PROJECTS/oxi/target
-   ✓    4.04 GiB  /Volumes/MERCURY/PROJECTS/session-a-web-platform/target
-   ✓   10.66 GiB  /Volumes/MERCURY/PROJECTS/session-b-cdp-perf/target
-
-총 확보: 42.47 GiB   (disk: 35% 사용, 607Gi 여유 → 35% 사용, 607Gi 여유)
+```sh
+RCLEANER_LANG=ru rcleaner --help
 ```
 
-```
-$ oxicleaner history
-시각                모드             확보    disk 변화
-----------------------------------------------------------------------
-2026-06-15 16:11   live      42.47 GiB  35% 사용, 607Gi 여유 → 32% 사용, 634Gi 여유
-2026-06-14 03:00   live       0.00 B    32% 사용, 634Gi 여유 → 32% 사용, 634Gi 여유
-2026-06-07 03:00   SKIP       프로세스 빌드 중
+```powershell
+$env:RCLEANER_LANG = 'ru'
+rcleaner --help
 ```
 
-## Building
+Descriptions, help headings, setup prompts, application errors and reports are
+translated. Command names and JSON field names are stable. Diagnostics originating
+from Cargo, the OS, clap's argument parser or the terminal library retain their
+own language. Existing history records retain the text recorded at execution time.
 
-```bash
-cargo build --release
-cargo test
-cargo clippy -D warnings
-cargo fmt --check
+Translation catalogs are in `locales/en.json`, `locales/ru.json` and
+`locales/ko.json`, embedded at compile time. Tests verify matching keys and
+numbered placeholders across catalogs.
+
+## What gets cleaned
+
+The scanner finds Cargo manifests below the root, skipping hidden directories,
+symlink traversal and conventional `target/` directories. Cargo metadata resolves
+actual target directories and shared workspace targets are deduplicated.
+Permission-denied errors below the scan root produce a warning and skip that
+path, allowing accessible projects to be found. An unreadable scan root and
+other discovery or artifact-deletion errors still abort the run. A custom
+Cargo target directory may be **outside** the scan root; inspect `--dry-run` output.
+
+The embedded engine derives from cargo-sweep 0.8.0 and uses Cargo fingerprint
+hashes and file access/modification times to identify old artifacts. It removes
+matching artifacts in profile `deps`, `build`, legacy `native`, fingerprint and
+profile directories. It preserves recent artifacts, unknown hashes and empty
+fingerprints. It does not remove incremental caches or arbitrary untracked files.
+See the [engine provenance and changes](vendor/cargo-sweep/README.md).
+
+Filesystem timestamps are a heuristic: disabled/coarse access-time updates can
+make age estimates inaccurate, and deleted artifacts may need rebuilding. The
+reported size is logical file size, not guaranteed newly available disk blocks.
+
+Before discovery and again before each target in a live run, the process guard postpones cleanup if it sees **any** `cargo`
+or `rustc` process, including Windows `.exe` names. This is conservative because
+build output can be redirected independently of process working directories.
+Process inspection failure aborts cleanup. This is a snapshot check, not a lock
+against a build starting later; schedule cleanup outside your build hours.
+A separate OS-backed lock prevents simultaneous rcleaner runs.
+
+Live runs and build-related skips are recorded in history. Dry-runs do not append
+history. Filesystem or metadata failures return a nonzero exit status; a failure
+after deletion has begun can leave a partially completed cleanup.
+
+## Scheduling
+
+`enable` copies the executable to `~/.rcleaner/`, records the Cargo executable
+path and installs a per-user weekly schedule. It does not need administrator
+privileges under normal user scheduler policy.
+
+- **Linux:** requires a working `systemctl --user` session. Timers use
+  `Persistent=true` to catch up missed runs when the user manager starts, including
+  immediately after enabling. User services normally follow login sessions;
+  running while logged out requires separately configured user lingering. Linux
+  without systemd supports manual cleanup, but not `enable`.
+- **macOS:** installs a LaunchAgent in the current user's GUI launchd domain.
+  The user must have a GUI login session. The LaunchAgent is named `local.rcleaner`.
+- **Windows:** registers a weekly task for the current user's SID with an
+  interactive token and limited privileges. It runs while that user is logged in,
+  with catch-up enabled. Default Task Scheduler battery/sleep restrictions apply.
+  No password is stored. The Windows PowerShell `ScheduledTasks` module is required.
+
+`disable` removes future scheduled triggers. It does not interrupt a cleanup
+already in progress. To change retention for scheduled execution, run `enable`
+again with the new `--days` value.
+
+| Location | Purpose |
+| --- | --- |
+| `~/.rcleaner/config.toml` | Root, retention and Cargo path |
+| `~/.rcleaner/rcleaner[.exe]` | Installed scheduled executable |
+| `~/.rcleaner/history.jsonl` | Run history, compatible with existing records |
+| `~/.rcleaner/sweep.lock` | Lock file; not a running-state indicator |
+| `$XDG_CONFIG_HOME/systemd/user/rcleaner.{service,timer}` | Linux units; config directory defaults to `~/.config` |
+| `~/Library/LaunchAgents/local.rcleaner.plist` | macOS LaunchAgent |
+| `~/Library/Logs/rcleaner/` | macOS scheduler stdout/stderr |
+| Task Scheduler → `Rcleaner-<user SID>` | Windows task |
+
+On Windows, `~` denotes the user's profile directory. Linux scheduler output is
+available with `journalctl --user -u rcleaner.service`. Windows Task Scheduler
+shows task status/exit codes; cleanup results are in `rcleaner history`.
+
+The original `root`/`days` configuration format remains supported. To migrate
+from oxicleaner, first run `oxicleaner disable` to stop the old schedule, then
+copy `config.toml` and optionally `history.jsonl` from `~/.oxicleaner/` into
+`~/.rcleaner/`. Run `rcleaner setup` or `rcleaner enable` to install the new
+schedule. rcleaner does not modify or remove the old installation automatically.
+Re-run `rcleaner enable` after upgrades to update the scheduled executable.
+
+## Development and releases
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo doc --workspace --no-deps --all-features --locked
 ```
 
-## Alternatives
+CI runs on Linux, macOS and Windows. Tests use temporary data and scheduler doubles;
+unit generation tests do not substitute for a real scheduler lifecycle test on
+each OS.
 
-- **`cargo clean`** — deletes the entire `target/`. Reliable, but forces a full
-  rebuild every time. Fine for occasional use, painful as a schedule.
-- **`cargo-sweep`** directly — the underlying engine. `oxicleaner` adds the
-  multi-project recursive scan, launchd scheduling, build-detection safety guard,
-  and history.
+The `Release binaries` workflow builds all five targets above and packages each
+executable with README, licenses and a SHA-256 checksum. A manual workflow run
+produces downloadable Actions artifacts. Pushing a `v<version>` tag matching
+`Cargo.toml` creates a **draft GitHub Release** after all builds and tests succeed;
+review and publish that draft. The workflow does not create tags or increment
+versions. Release executables are not code-signed or notarized.
+
+The packaging script can also be run locally (Python 3.11+):
+
+```sh
+cargo build --release --locked --target x86_64-unknown-linux-gnu
+python scripts/package.py x86_64-unknown-linux-gnu
+```
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE). The embedded cargo-sweep derivative retains its
+[original MIT license](vendor/cargo-sweep/LICENSE), also included in release archives.
